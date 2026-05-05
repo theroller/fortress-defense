@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Fortress Defense</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    canvas { display: block; touch-action: none; }
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+
+// ================================================================
+// FORTRESS DEFENSE — Team Mode
+// Finn plays the LEFT side, Ford plays the RIGHT side.
+// Cannonballs attack from both edges. Tap near a broken block
+// to repair it before the next cannonball gets through!
+// ================================================================
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// Make the canvas fill the whole screen
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+// ---- GAME SETTINGS ----
+const NUMBER_OF_ROWS = 8;          // How many blocks tall the wall is
+const BLOCK_WIDTH = 50;            // How wide each wall block is (pixels)
+const BLOCK_HEIGHT = Math.min(60, Math.floor(canvas.height * 0.7 / NUMBER_OF_ROWS));
+const CANNONBALL_RADIUS = 14;      // Size of cannonballs
+const BASE_SPEED = 180;            // How fast cannonballs move (pixels per second)
+const REPAIR_TIME = 1.0;           // Seconds to fully repair a broken block
+const MAX_HEALTH = 10;             // Hits before game over
+const BASE_CANNONBALLS = 4;        // Cannonballs in wave 1 (grows each wave)
+
+// ---- COLORS ----
+const BG_COLOR        = '#1a1a2e';
+const FINN_ZONE_COLOR = 'rgba(60, 100, 200, 0.12)';
+const FORD_ZONE_COLOR = 'rgba(200, 60, 60, 0.12)';
+const BLOCK_INTACT    = '#8b8680';
+const BLOCK_BROKEN    = '#3a2a2a';
+const BLOCK_REPAIRING = '#a07850';
+const BALL_COLOR      = '#2a2a2a';
+const FINN_LABEL      = '#6699ff';
+const FORD_LABEL      = '#ff6666';
+
+// ---- LAYOUT ----
+// The wall sits dead-center. Left half = Finn's zone. Right half = Ford's.
+const wallCenterX  = canvas.width / 2;
+const totalWallH   = NUMBER_OF_ROWS * BLOCK_HEIGHT;
+const wallTopY     = (canvas.height - totalWallH) / 2;
+
+// Get the Y center of a wall row (used to aim cannonballs)
+function rowCenterY(rowIndex) {
+  return wallTopY + rowIndex * BLOCK_HEIGHT + BLOCK_HEIGHT / 2;
+}
+
+// Given a Y pixel position, return which wall row it's closest to
+function rowFromY(y) {
+  const row = Math.floor((y - wallTopY) / BLOCK_HEIGHT);
+  return Math.max(0, Math.min(NUMBER_OF_ROWS - 1, row));
+}
+
+// ---- GAME STATE ----
+let wallBlocks = [];    // Array of { state: 'intact'|'broken'|'repairing', repairProgress: 0..1 }
+let health = MAX_HEALTH;
+let wave = 1;
+let cannonballs = [];   // Active cannonballs on screen
+let particles = [];     // Visual debris when things get hit
+let gamePhase = 'playing';  // 'playing', 'wave-clear', 'game-over'
+let waveClearTimer = 0;     // Countdown between waves (seconds)
+let ballsThisWave = 0;      // How many balls are in this wave
+let ballsSpawned = 0;       // How many have been sent so far
+let spawnTimer = 0;         // Time until next ball spawns
+let lastTimestamp = null;   // Used to calculate deltaTime each frame
+
+// ---- INIT ----
+function initGame() {
+  wallBlocks = [];
+  for (let i = 0; i < NUMBER_OF_ROWS; i++) {
+    wallBlocks.push({ state: 'intact', repairProgress: 0 });
+  }
+  health = MAX_HEALTH;
+  wave = 1;
+  cannonballs = [];
+  particles = [];
+  gamePhase = 'playing';
+  lastTimestamp = null;
+  startWave();
+}
+
+// ---- WAVE MANAGEMENT ----
+function startWave() {
+  // Each wave has more cannonballs and they move a bit faster
+  ballsThisWave = BASE_CANNONBALLS + (wave - 1) * 2;
+  ballsSpawned = 0;
+  spawnTimer = 0.3;  // Short pause before first ball of the wave
+  gamePhase = 'playing';
+  console.log('Wave', wave, '— sending', ballsThisWave, 'cannonballs');
+}
+
+function spawnCannonball() {
+  const targetRow = Math.floor(Math.random() * NUMBER_OF_ROWS);
+  const y = rowCenterY(targetRow);
+  const fromLeft = Math.random() < 0.5;
+  const startX = fromLeft ? -CANNONBALL_RADIUS : canvas.width + CANNONBALL_RADIUS;
+  const speed = BASE_SPEED + (wave - 1) * 20;  // Gets faster each wave
+
+  cannonballs.push({
+    x: startX,
+    y: y,
+    row: targetRow,
+    vx: fromLeft ? speed : -speed,  // positive = moving right, negative = moving left
+    fromLeft: fromLeft,
+    hasHitWall: false
+  });
+
+  ballsSpawned++;
+  console.log('Cannonball aimed at row', targetRow, 'from the', fromLeft ? 'left' : 'right');
+}
+
+// ---- REPAIR ----
+function tryRepair(tapY) {
+  const row = rowFromY(tapY);
+  const block = wallBlocks[row];
+
+  // Only start a repair if the block is actually broken (not already being fixed or fine)
+  if (block.state === 'broken') {
+    block.state = 'repairing';
+    block.repairProgress = 0;
+    addParticles(wallCenterX, rowCenterY(row), '#c09860', 6);
+    console.log('Started repairing row', row);
+  }
+}
+
+// ---- PARTICLES ----
+function addParticles(x, y, color, count) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x: x,
+      y: y,
+      vx: (Math.random() - 0.5) * 220,
+      vy: (Math.random() - 0.5) * 220,
+      life: 0.5,
+      maxLife: 0.5,
+      color: color,
+      size: Math.random() * 8 + 3
+    });
+  }
+}
+
+// ---- UPDATE (called every frame) ----
+function update(dt) {
+  if (gamePhase === 'game-over') return;
+
+  // --- Advance repairs ---
+  for (let i = 0; i < NUMBER_OF_ROWS; i++) {
+    const block = wallBlocks[i];
+    if (block.state === 'repairing') {
+      block.repairProgress += dt / REPAIR_TIME;
+      if (block.repairProgress >= 1) {
+        block.state = 'intact';
+        block.repairProgress = 1;
+        console.log('Row', i, 'repaired!');
+      }
+    }
+  }
+
+  // --- Spawn cannonballs on a timer ---
+  if (ballsSpawned < ballsThisWave) {
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnCannonball();
+      // Gap between spawns shrinks each wave (but never faster than 0.4s)
+      spawnTimer = Math.max(0.4, 1.3 - (wave - 1) * 0.1);
+    }
+  }
+
+  // --- Move cannonballs and check wall collisions ---
+  for (let i = cannonballs.length - 1; i >= 0; i--) {
+    const ball = cannonballs[i];
+    ball.x += ball.vx * dt;
+
+    // Has the ball reached the wall zone yet?
+    const wallLeft  = wallCenterX - BLOCK_WIDTH / 2;
+    const wallRight = wallCenterX + BLOCK_WIDTH / 2;
+    const reachedWall = ball.fromLeft ? ball.x >= wallLeft : ball.x <= wallRight;
+
+    if (reachedWall && !ball.hasHitWall) {
+      ball.hasHitWall = true;
+      const block = wallBlocks[ball.row];
+
+      if (block.state === 'intact') {
+        // Wall block stops the cannonball — block takes the hit
+        block.state = 'broken';
+        block.repairProgress = 0;
+        addParticles(wallCenterX, rowCenterY(ball.row), '#888888', 14);
+        console.log('Row', ball.row, 'block destroyed!');
+      } else {
+        // Gap in the wall — cannonball gets through, fortress takes damage
+        health -= 1;
+        addParticles(wallCenterX, rowCenterY(ball.row), '#ff4444', 18);
+        console.log('Cannonball through gap at row', ball.row, '— health:', health);
+        if (health <= 0) {
+          health = 0;
+          gamePhase = 'game-over';
+          console.log('Game over! Survived', wave, 'waves.');
+        }
+      }
+
+      // Remove cannonball now that it's resolved
+      cannonballs.splice(i, 1);
+      continue;
+    }
+
+    // Remove balls that flew off screen (safety cleanup)
+    if (ball.x < -80 || ball.x > canvas.width + 80) {
+      cannonballs.splice(i, 1);
+    }
+  }
+
+  // --- Check if wave is finished ---
+  if (gamePhase === 'playing' && ballsSpawned >= ballsThisWave && cannonballs.length === 0) {
+    wave++;
+    gamePhase = 'wave-clear';
+    waveClearTimer = 2.5;
+    console.log('Wave cleared! Preparing wave', wave);
+  }
+
+  // --- Count down between waves ---
+  if (gamePhase === 'wave-clear') {
+    waveClearTimer -= dt;
+    if (waveClearTimer <= 0) {
+      startWave();
+    }
+  }
+
+  // --- Update particles ---
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 280 * dt;  // gravity pulls debris down
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+// ---- DRAW (called every frame) ----
+function draw() {
+  // Background
+  ctx.fillStyle = BG_COLOR;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Player zones — subtle color wash on each half
+  ctx.fillStyle = FINN_ZONE_COLOR;
+  ctx.fillRect(0, 0, canvas.width / 2, canvas.height);
+  ctx.fillStyle = FORD_ZONE_COLOR;
+  ctx.fillRect(canvas.width / 2, 0, canvas.width / 2, canvas.height);
+
+  // Dashed center line (the wall divider)
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([10, 10]);
+  ctx.beginPath();
+  ctx.moveTo(wallCenterX, 0);
+  ctx.lineTo(wallCenterX, canvas.height);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // ---- DRAW WALL BLOCKS ----
+  for (let i = 0; i < NUMBER_OF_ROWS; i++) {
+    const block = wallBlocks[i];
+    const bx = wallCenterX - BLOCK_WIDTH / 2;
+    const by = wallTopY + i * BLOCK_HEIGHT;
+
+    if (block.state === 'intact') {
+      // Solid stone block
+      ctx.fillStyle = BLOCK_INTACT;
+      ctx.fillRect(bx, by, BLOCK_WIDTH, BLOCK_HEIGHT);
+      // Darker border for brick feel
+      ctx.strokeStyle = '#5a5550';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bx + 1, by + 1, BLOCK_WIDTH - 2, BLOCK_HEIGHT - 2);
+      // Light highlight along the top edge
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+      ctx.fillRect(bx + 3, by + 3, BLOCK_WIDTH - 6, 7);
+
+    } else if (block.state === 'broken') {
+      // Dark crumbled hole
+      ctx.fillStyle = BLOCK_BROKEN;
+      ctx.fillRect(bx, by, BLOCK_WIDTH, BLOCK_HEIGHT);
+      // Red X to show it's a gap
+      ctx.strokeStyle = '#883333';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(bx + 6, by + 6);
+      ctx.lineTo(bx + BLOCK_WIDTH - 6, by + BLOCK_HEIGHT - 6);
+      ctx.moveTo(bx + BLOCK_WIDTH - 6, by + 6);
+      ctx.lineTo(bx + 6, by + BLOCK_HEIGHT - 6);
+      ctx.stroke();
+
+    } else if (block.state === 'repairing') {
+      // Show the broken hole underneath...
+      ctx.fillStyle = BLOCK_BROKEN;
+      ctx.fillRect(bx, by, BLOCK_WIDTH, BLOCK_HEIGHT);
+      // ...then draw the repair filling up from the bottom
+      const fillHeight = BLOCK_HEIGHT * block.repairProgress;
+      ctx.fillStyle = BLOCK_REPAIRING;
+      ctx.fillRect(bx, by + BLOCK_HEIGHT - fillHeight, BLOCK_WIDTH, fillHeight);
+      // Orange border while building
+      ctx.strokeStyle = '#c09860';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bx + 1, by + 1, BLOCK_WIDTH - 2, BLOCK_HEIGHT - 2);
+    }
+  }
+
+  // ---- DRAW CANNONBALLS ----
+  for (const ball of cannonballs) {
+    // Drop shadow
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+    ctx.beginPath();
+    ctx.ellipse(ball.x + 4, ball.y + 5, CANNONBALL_RADIUS, CANNONBALL_RADIUS * 0.6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Main ball
+    ctx.fillStyle = BALL_COLOR;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, CANNONBALL_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+    // Shine
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.18)';
+    ctx.beginPath();
+    ctx.arc(ball.x - 4, ball.y - 4, CANNONBALL_RADIUS * 0.38, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ---- DRAW PARTICLES ----
+  for (const p of particles) {
+    ctx.globalAlpha = p.life / p.maxLife;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  // ---- HUD ----
+  drawHealthBar();
+
+  // Player name labels
+  ctx.font = 'bold 26px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = FINN_LABEL;
+  ctx.fillText('FINN', canvas.width * 0.25, 45);
+  ctx.fillStyle = FORD_LABEL;
+  ctx.fillText('FORD', canvas.width * 0.75, 45);
+
+  // Wave counter (center top)
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 22px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText('WAVE  ' + (gamePhase === 'game-over' ? wave - 1 : wave), wallCenterX, 45);
+
+  // Repair hint — only shown when there are broken blocks to fix
+  const hasBrokenBlocks = wallBlocks.some(b => b.state === 'broken');
+  if (hasBrokenBlocks) {
+    ctx.font = 'bold 16px Arial';
+    ctx.fillStyle = 'rgba(255, 200, 80, 0.9)';
+    ctx.textAlign = 'right';
+    ctx.fillText('TAP TO REPAIR ▶', wallCenterX - BLOCK_WIDTH / 2 - 8, canvas.height / 2);
+    ctx.textAlign = 'left';
+    ctx.fillText('◀ TAP TO REPAIR', wallCenterX + BLOCK_WIDTH / 2 + 8, canvas.height / 2);
+  }
+
+  // Wave clear banner
+  if (gamePhase === 'wave-clear') {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    ctx.fillRect(wallCenterX - 170, canvas.height / 2 - 55, 340, 110);
+    ctx.fillStyle = '#ffff44';
+    ctx.font = 'bold 38px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('WAVE CLEAR!', wallCenterX, canvas.height / 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '22px Arial';
+    ctx.fillText('Wave ' + wave + ' incoming...', wallCenterX, canvas.height / 2 + 42);
+  }
+
+  // Game over screen
+  if (gamePhase === 'game-over') {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#ff4444';
+    ctx.font = 'bold 54px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('FORTRESS FALLEN!', wallCenterX, canvas.height / 2 - 60);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 30px Arial';
+    ctx.fillText('You survived ' + (wave - 1) + ' wave' + (wave - 1 === 1 ? '' : 's') + '!', wallCenterX, canvas.height / 2);
+    ctx.fillStyle = '#aaaaaa';
+    ctx.font = '22px Arial';
+    ctx.fillText('Tap anywhere to play again', wallCenterX, canvas.height / 2 + 55);
+  }
+}
+
+function drawHealthBar() {
+  const barWidth  = 220;
+  const barHeight = 26;
+  const barX = wallCenterX - barWidth / 2;
+  const barY = canvas.height - 55;
+  const pct = health / MAX_HEALTH;
+
+  // Background track
+  ctx.fillStyle = '#333333';
+  ctx.fillRect(barX, barY, barWidth, barHeight);
+
+  // Fill color: green → yellow → red based on how much health remains
+  if (pct > 0.6)      ctx.fillStyle = '#44bb44';
+  else if (pct > 0.3) ctx.fillStyle = '#bbbb44';
+  else                ctx.fillStyle = '#bb4444';
+
+  ctx.fillRect(barX, barY, barWidth * pct, barHeight);
+
+  // Border
+  ctx.strokeStyle = '#aaaaaa';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(barX, barY, barWidth, barHeight);
+
+  // Label above the bar
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 14px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText('FORTRESS HEALTH', wallCenterX, barY - 6);
+}
+
+// ---- INPUT ----
+function handleInput(tapX, tapY) {
+  if (gamePhase === 'game-over') {
+    initGame();
+    return;
+  }
+  // Either player can repair any broken block — tap near the row you want to fix
+  tryRepair(tapY);
+}
+
+// Touch (iPad)
+canvas.addEventListener('touchstart', function(e) {
+  e.preventDefault();  // Stop the browser from scrolling or zooming
+  for (const touch of e.changedTouches) {
+    const rect = canvas.getBoundingClientRect();
+    handleInput(touch.clientX - rect.left, touch.clientY - rect.top);
+  }
+}, { passive: false });
+
+// Click (desktop / testing)
+canvas.addEventListener('click', function(e) {
+  const rect = canvas.getBoundingClientRect();
+  handleInput(e.clientX - rect.left, e.clientY - rect.top);
+});
+
+// ---- GAME LOOP ----
+function gameLoop(timestamp) {
+  // deltaTime = seconds since the last frame (we cap it to avoid huge jumps after tab switches)
+  if (lastTimestamp === null) lastTimestamp = timestamp;
+  const dt = Math.min((timestamp - lastTimestamp) / 1000, 0.1);
+  lastTimestamp = timestamp;
+
+  update(dt);
+  draw();
+
+  requestAnimationFrame(gameLoop);
+}
+
+// ---- GO! ----
+initGame();
+requestAnimationFrame(gameLoop);
+
+</script>
+</body>
+</html>
