@@ -316,8 +316,11 @@ function updateGuest(dt) {
   }
 }
 
+let guestReady = false;  // true once the guest receives its first state packet
+
 // Guest applies the state packet the host sent
 function applyHostState(data) {
+  guestReady   = true;
   sharedWall   = data.wall;
   sharedHealth = data.health;
   wave         = data.wave;
@@ -381,7 +384,7 @@ function submitCode() {
 
   peer = new Peer();
   peer.on('open', function() {
-    conn = peer.connect('fd' + typedCode, { reliable: true });
+    conn = peer.connect('fd' + typedCode, { serialization: 'json' });
     conn.on('open', function() {
       gamePhase = 'playing';  // waiting for host's first state packet
     });
@@ -449,6 +452,7 @@ function drawBlock(block, bx, by) {
 
 function drawWall(wall, wallX) {
   for (let i = 0; i < ROWS; i++) {
+    if (!wall[i]) continue;  // skip if state not yet received from host
     drawBlock(wall[i], wallX - BLOCK_W / 2, wallTopY + i * BLOCK_H);
   }
 }
@@ -653,6 +657,13 @@ function drawGame() {
   ctx.fillStyle = 'rgba(60,100,200,0.1)';  ctx.fillRect(0, 0, canvas.width / 2, canvas.height);
   ctx.fillStyle = 'rgba(200,60,60,0.1)';   ctx.fillRect(canvas.width / 2, 0, canvas.width / 2, canvas.height);
 
+  // Guest shows a waiting screen until the first state packet arrives from the host
+  if (playerRole === 'guest' && !guestReady) {
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 28px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('Waiting for game' + '.'.repeat(1 + Math.floor(Date.now() / 500) % 3), canvas.width / 2, canvas.height / 2);
+    return;
+  }
+
   if (gameMode === 'team') {
     drawWall(sharedWall, TEAM_WALL_X);
     if (sharedWall.some(b => b.state === 'broken')) {
@@ -806,20 +817,23 @@ function gameLoop(timestamp) {
   }
 
   // Host sends state to guest at ~20fps
-  if (playerRole === 'host' && conn && conn.open) {
+  // Use try/catch instead of checking conn.open — PeerJS 1.5.x can lag on updating that flag
+  if (playerRole === 'host' && conn) {
     const now = Date.now();
     if (now - lastSendMs >= 50) {
       lastSendMs = now;
-      conn.send({
-        type:   'state',
-        wall:   sharedWall,
-        health: sharedHealth,
-        wave,
-        phase:  gamePhase,
-        balls:  cannonballs.map(b => ({ x: b.x, y: b.y, row: b.row, fromLeft: b.fromLeft, vx: b.vx })),
-        events: pendingEvts
-      });
-      pendingEvts = [];
+      try {
+        conn.send({
+          type:   'state',
+          wall:   sharedWall,
+          health: sharedHealth,
+          wave,
+          phase:  gamePhase,
+          balls:  cannonballs.map(b => ({ x: b.x, y: b.y, row: b.row, fromLeft: b.fromLeft, vx: b.vx })),
+          events: pendingEvts
+        });
+        pendingEvts = [];
+      } catch(e) { /* connection not ready yet — will retry next frame */ }
     }
   }
 
